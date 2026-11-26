@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         Payment Verifier
 // @namespace    https://github.com/avik712/payment-verifier
-// @version      2.0.0
-// @description  Gmail add-on: paste a payment screenshot -> saved to Google Sheet. Admin uploads the bank statement (Excel/CSV/PDF, password supported) -> rows marked Verified (green) / Not Verified (red).
-// @match        https://mail.google.com/*
+// @version      2.1.0
+// @description  Works on any website (switch it on in Tampermonkey): paste a payment screenshot -> saved to Google Sheet. Admin uploads the bank statement (Excel/CSV/PDF, password supported) -> rows marked Verified (green) / Not Verified (red).
+// @match        *://*/*
 // @run-at       document-idle
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -23,7 +23,8 @@
   'use strict';
   if (window.top !== window.self) return;
 
-  const SHOW_FLOATING_BUTTON = true;   // false = open only from the Tampermonkey menu
+  // How to open it on any site: Tampermonkey icon -> "Open Payment Verifier", or press Alt+Shift+P.
+  // The floating button is hidden by default; use the Tampermonkey menu item "Show/Hide floating button" to turn it on.
   const DATE_TOLERANCE_DAYS = 0;       // 0 = bank date must equal payment date exactly; 1 = allow +/- 1 day
 
   // ---- CORE-START (pure logic, no browser APIs) ----
@@ -303,14 +304,22 @@
 
   // ================= UI (Shadow DOM, styled) =================
   let policy = null;
-  try { if (window.trustedTypes && trustedTypes.createPolicy) policy = trustedTypes.createPolicy('pv-ui', { createHTML: (s) => s }); } catch (e) { policy = null; }
+  try { if (window.trustedTypes && trustedTypes.createPolicy) policy = trustedTypes.createPolicy('pv-ui', { createHTML: (s) => s, createScriptURL: (s) => s }); } catch (e) { policy = null; }
+  // strict sites (Gmail, Google...) demand a TrustedScriptURL for new Worker(): wrap it for our OCR / PDF workers
+  try {
+    if (policy && window.Worker) {
+      const NativeWorker = window.Worker;
+      const Wrapped = function (url, opts) { return new NativeWorker(typeof url === 'string' ? policy.createScriptURL(url) : url, opts); };
+      Wrapped.prototype = NativeWorker.prototype; window.Worker = Wrapped;
+    }
+  } catch (e) { /* ignore */ }
   const html = (s) => (policy ? policy.createHTML(s) : s);
   const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
   const CSS = `
 :host{all:initial}
 *{box-sizing:border-box;font-family:'Google Sans',Inter,system-ui,-apple-system,'Segoe UI',Roboto,Arial,sans-serif}
-.fab{position:fixed;right:76px;bottom:24px;display:flex;align-items:center;gap:8px;padding:12px 20px;border:0;border-radius:999px;color:#fff;font-size:14px;font-weight:600;letter-spacing:.2px;cursor:pointer;
+.fab{position:fixed;right:24px;bottom:24px;display:flex;align-items:center;gap:8px;padding:12px 20px;border:0;border-radius:999px;color:#fff;font-size:14px;font-weight:600;letter-spacing:.2px;cursor:pointer;
  background:linear-gradient(135deg,#4f46e5,#7c3aed 55%,#db2777);box-shadow:0 8px 24px rgba(79,70,229,.45);transition:transform .2s,box-shadow .2s}
 .fab:hover{transform:translateY(-3px) scale(1.03);box-shadow:0 14px 32px rgba(124,58,237,.55)}
 .ov{position:fixed;inset:0;display:none;background:rgba(15,23,42,.55);backdrop-filter:blur(6px);overflow:auto;animation:fade .2s ease}
@@ -398,7 +407,8 @@ table{border-collapse:collapse;width:100%;font-size:12px;background:#fff}th{back
   const wrap = document.createElement('div'); wrap.innerHTML = html(TPL); root.appendChild(wrap);
   document.documentElement.appendChild(host);
   const $ = (id) => root.getElementById(id);
-  if (!SHOW_FLOATING_BUTTON) $('fab').style.display = 'none';
+  const applyFab = () => { $('fab').style.display = GM_getValue('showFab', false) ? 'flex' : 'none'; };
+  applyFab();
 
   const openUI = () => { $('ov').classList.add('on'); if (!cfg().url) showSettings(true); };
   const closeUI = () => $('ov').classList.remove('on');
@@ -409,6 +419,8 @@ table{border-collapse:collapse;width:100%;font-size:12px;background:#fff}th{back
   $('bSave').onclick = () => { GM_setValue('url', $('sUrl').value.trim()); GM_setValue('key', $('sKey').value.trim()); showSettings(false); };
   window.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeUI(); });
   GM_registerMenuCommand('Open Payment Verifier', openUI);
+  GM_registerMenuCommand('Show/Hide floating button', () => { GM_setValue('showFab', !GM_getValue('showFab', false)); applyFab(); });
+  window.addEventListener('keydown', (e) => { if (e.altKey && e.shiftKey && e.code === 'KeyP') { e.preventDefault(); openUI(); } }, true);
 
   // ---- employee ----
   async function handleImage(file) {
@@ -423,7 +435,12 @@ table{border-collapse:collapse;width:100%;font-size:12px;background:#fff}th{back
       const miss = [['UTR', r.utr], ['Amount', r.amount], ['Date', r.date], ['Payer bank last 4', r.last4]].filter((x) => !x[1]).map((x) => x[0]);
       msg($('ocrMsg'), (miss.length ? 'Could not read: ' + miss.join(', ') + '. Please type them.\n' : '✓ Details read. ') +
         (r.failedHint ? '⚠ Screenshot may show a failed/pending payment.\n' : '') + 'Check them against the screenshot before saving.', miss.length ? 'err' : 'okm');
-    } catch (e) { msg($('ocrMsg'), 'Could not read the screenshot (' + e.message + '). Please type the details manually.', 'err'); }
+    } catch (e) {
+      const blocked = /Trusted|Content Security|CSP|importScripts|NetworkError|Failed to fetch|Failed to construct/i.test(String(e && e.message || e));
+      msg($('ocrMsg'), blocked
+        ? 'This website\'s security blocks the screenshot reader. Open Payment Verifier on another site/tab (any normal website, e.g. example.com) – or type the details manually below.'
+        : 'Could not read the screenshot (' + (e && e.message || e) + '). Please type the details manually.', 'err');
+    }
     $('bar').style.display = 'none';
   }
   $('fFile').onchange = (e) => handleImage(e.target.files[0]);
